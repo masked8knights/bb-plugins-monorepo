@@ -1,0 +1,9 @@
+{
+  "name": "bb-plugins-monorepo",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Private monorepo of bb plugins and fixes: usage, antigravity/agy, prime-agent, patches, unified skills + AGENTS.md, and the bb automation scripts.",
+  "workspaces": [
+    "plugins/*"
+  ]
+}

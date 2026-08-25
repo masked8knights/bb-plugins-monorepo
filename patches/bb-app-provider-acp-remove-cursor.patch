@@ -1,0 +1,26 @@
+--- server.js.bak-cursor	2026-08-25 23:03:47.109765836 +1000
++++ server.js	2026-08-25 23:09:20.217048883 +1000
+@@ -7,15 +7,19 @@
+ 
+ // ../../plugins/provider-acp/server.ts
+ function plugin(bb) {
++  // acp-cursor removed (Cursor CLI not used). Register acp-opencode from the
++  // plugin so the ACP provider tier stays active, which is what lets known
++  // agents (acp-opencode/acp-omp/acp-grok/acp-hermes-agent) and custom ACP
++  // agents (acp-prime-agent) be listed and launched. The launch spec itself
++  // still comes from bb's known-agent data for acp-opencode.
+   bb.agents.experimental_registerProvider({
+-    id: "acp-cursor",
+-    displayName: "Cursor",
+-    icon: "./icons/cursor.svg",
++    id: "acp-opencode",
++    displayName: "opencode",
+     capabilities: {
+       supportsServiceTier: true,
+       supportsNativeUserQuestion: false,
+       fork: "tip",
+-      supportsManualCompaction: false,
++      supportsManualCompaction: true,
+       supportsThreadArchive: false,
+       supportsThreadRename: false,
+       supportsWorkflows: false,
