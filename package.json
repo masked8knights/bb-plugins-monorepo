@@ -1,9 +1,20 @@
 {
   "name": "bb-plugins-monorepo",
-  "private": true,
   "version": "0.1.0",
-  "description": "Private monorepo of bb plugins and fixes: usage, antigravity/agy, prime-agent, patches, unified skills + AGENTS.md, and the bb automation scripts.",
-  "workspaces": [
-    "plugins/*"
-  ]
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "pnpm -r --if-present build",
+    "typecheck": "pnpm -r --if-present typecheck",
+    "dev": "pnpm -r --if-present dev",
+    "clean": "pnpm -r --if-present clean",
+    "plugins:install": "bash scripts/install-all.sh"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0"
+  },
+  "packageManager": "pnpm@11.10.0",
+  "engines": {
+    "node": ">=22.19.0"
+  }
 }
