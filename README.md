@@ -8,6 +8,7 @@ plugin, installed with `bb plugin install <dir>` or built with `bb plugin build`
 | Package | What | Source |
 |---|---|---|
 | `packages/bb-plugin-usage` | Usage dashboard plugin: logged-cost pricing, local-day buckets, cache savings, opencode skip-when-no-CLI, zero-token guard. | `MayankBansal12/bb-plugin-usage` |
+| `packages/bb-plugin-antigravity-acp` | agy/Antigravity provider: one model entry per family + a real reasoning-effort picker (low/medium/high), re-encoded into the full agy id at turn time. | `nuchareviews-beep/bb-plugin-antigravity-acp` |
 | `packages/bb-plugin-prime-agent` | prime-agent provider whose shim passes `--continue` so bb thread restarts resume the session. | `patleeman/bb-plugins` (`packages/bb-plugin-prime-agent`) |
 
 Each package is a vendored snapshot refreshed by the `sync-plugins` automation:
