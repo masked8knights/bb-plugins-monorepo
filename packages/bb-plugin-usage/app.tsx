@@ -118,6 +118,7 @@ type DashboardData = {
     windows: ProviderLimitWindow[];
     status: "ok" | "error";
     error: string | null;
+    lastUpdatedAt: string | null;
   }>;
   sync: UsageSyncSnapshot;
   notice: string;
@@ -714,15 +715,19 @@ function ProviderLimits({
                       </span>
                       {limit.planLabel && <div className="max-w-[45%] shrink-0 truncate text-[10px] text-muted-foreground" title={limit.planLabel}>{limit.planLabel}</div>}
                     </div>
-                    {limit.status === "error" ? (
+                    {limit.status === "error" && (
                       <div className="mt-2 flex items-start gap-1.5">
                         <Icon name="AlertCircle" className="mt-px size-3.5 shrink-0 text-destructive" aria-hidden="true" />
                         <p className="text-[10px] leading-4 text-destructive/90">
                           {limit.error ? `Couldn’t load ${limit.providerName} limits: ${limit.error}` : `${limit.providerName} limits unavailable`}
+                          {limit.windows.length > 0
+                            ? ` Showing cached values${limit.lastUpdatedAt ? ` from ${new Date(limit.lastUpdatedAt).toLocaleString()}` : ""}.`
+                            : ""}
                         </p>
                       </div>
-                    ) : (
-                    <div className="mt-1.5 space-y-1.5">
+                    )}
+                    {limit.windows.length > 0 && (
+                      <div className="mt-1.5 space-y-1.5">
                       {limit.windows.map((window, index) => {
                         const reset = formatLimitReset(window.resetsAt);
                         const usedPercent = clampPercent(window.usedPercent);
@@ -751,7 +756,7 @@ function ProviderLimits({
                           </div>
                         );
                       })}
-                    </div>
+                      </div>
                     )}
                   </div>
                 ))}
@@ -956,9 +961,13 @@ function UsageDashboard() {
   const rows = useMemo(() => {
     if (!data) return [];
     const days = rangeDays(range);
-    const cutoffDay = days[0];
+    // Bound both ends. Rows are bucketed in each host's local timezone, so a
+    // host ahead of the viewer can emit a day beyond today; without the upper
+    // bound those rows land in the headline totals while the chart -- which
+    // only has buckets for `days` -- silently drops them.
+    const [cutoffDay, latestDay] = [days[0], days[days.length - 1]];
     return data.records.filter((row) =>
-      row.day >= cutoffDay
+      row.day >= cutoffDay && row.day <= latestDay
       && (machine === "all" || row.machineId === machine));
   }, [data, machine, range]);
 

@@ -7,6 +7,7 @@ import {
   type AgentId, type UsageRecord,
 } from "./collectors";
 import { activateCachedCatalog, refreshCatalog } from "./lib/catalog";
+import { openCodeGoUsageCommand, parseOpenCodeGoUsage } from "./lib/opencode-go";
 import {
   compressedHostJsonCollectorScript,
   extractHostJsonScan,
@@ -40,7 +41,7 @@ const providerLimitWindowSchema = z.object({
 const providerLimitSchema = z.object({
   machineId: z.string(), machineName: z.string(), providerId: z.string(), providerName: z.string(),
   planLabel: z.string().nullable(), windows: z.array(providerLimitWindowSchema),
-  status: z.enum(["ok", "error"]), error: z.string().nullable(),
+  status: z.enum(["ok", "error"]), error: z.string().nullable(), lastUpdatedAt: z.string().nullable(),
 });
 type DashboardRecord = z.infer<typeof usageRecordSchema>;
 type SourceState = z.infer<typeof sourceStateSchema>;
@@ -81,6 +82,8 @@ const SYNC_HOSTS_TIMEOUT_MS = 10_000;
 const HOST_DIRECTORY_TIMEOUT_MS = 10_000;
 const JSON_AGENT_SYNC_TIMEOUT_MS = 10 * 60_000;
 const OPENCODE_SYNC_TIMEOUT_MS = 60_000;
+const OPENCODE_GO_SYNC_TIMEOUT_MS = 60_000;
+const OPENCODE_GO_ABSENCE_ERRORS = new Set(["no-opencode-go-credential", "no-opencode-go-plan"]);
 const DASHBOARD_HISTORY_DAYS = 90;
 const OPENCODE_HISTORY_DAYS = DASHBOARD_HISTORY_DAYS;
 const HISTORY_DAYS = 365;
@@ -119,6 +122,7 @@ export async function loadProviderLimits(
               windows: limit.windows,
               status: "ok",
               error: null,
+              lastUpdatedAt: null,
             }];
           }
           if (limit.status === "error") {
@@ -132,6 +136,7 @@ export async function loadProviderLimits(
               windows: [],
               status: "error",
               error: limit.message,
+              lastUpdatedAt: null,
             }];
           }
           return [];
@@ -150,6 +155,7 @@ export async function loadProviderLimits(
             windows: [],
             status: "error",
             error: message,
+            lastUpdatedAt: null,
           }));
       }
     }))).flat();
@@ -194,6 +200,15 @@ CREATE INDEX IF NOT EXISTS usage_events_project_idx ON usage_events(project, day
 `;
 const pricingCatalogMigration = `CREATE TABLE IF NOT EXISTS pricing_catalog (
   id INTEGER PRIMARY KEY CHECK (id = 1), revision TEXT NOT NULL, fetched_at TEXT NOT NULL, data TEXT NOT NULL
+);`;
+const openCodeGoLimitsMigration = `
+CREATE TABLE IF NOT EXISTS opencode_go_limits (
+  machine_id TEXT PRIMARY KEY, machine_name TEXT NOT NULL, plan_label TEXT NOT NULL DEFAULT 'Go',
+  windows_json TEXT NOT NULL, fetched_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS opencode_go_limit_state (
+  machine_id TEXT PRIMARY KEY, machine_name TEXT NOT NULL, status TEXT NOT NULL,
+  error TEXT, last_attempt_at TEXT NOT NULL, last_success_at TEXT
 );`;
 
 function opaqueId(...parts: string[]) {
@@ -307,6 +322,8 @@ function reconcileMachines(db: Database, machineIds: string[]) {
     for (const source of stale) db.prepare("DELETE FROM usage_event_sources WHERE source_id=?").run(source.id);
     db.prepare(`DELETE FROM usage_sources WHERE machine_id NOT IN (${placeholders})`).run(...machineIds);
     db.prepare(`DELETE FROM usage_sync_state WHERE machine_id NOT IN (${placeholders})`).run(...machineIds);
+    db.prepare(`DELETE FROM opencode_go_limits WHERE machine_id NOT IN (${placeholders})`).run(...machineIds);
+    db.prepare(`DELETE FROM opencode_go_limit_state WHERE machine_id NOT IN (${placeholders})`).run(...machineIds);
     db.prepare("DELETE FROM usage_events WHERE event_key NOT IN (SELECT event_key FROM usage_event_sources)").run();
   })();
 }
@@ -461,16 +478,18 @@ export async function runHostCommand(
 // OpenCode usage is collected on the enrolled HOST (via `opencode db`), so the
 // day bucket and the 90-day cutoff MUST use the host's local timezone, not
 // UTC. Otherwise machines in a positive/negative offset see "today"'s usage
-// land in the previous/next UTC day. The plugin server owns the rolling window
-// (dashboardRecordsSql uses `localtime` too); in a single-machine deployment
-// the BB server runs in the same timezone as the enrolled host.
+// land in the previous/next UTC day.
+//
+// The trailing 'utc' modifier is required: 'localtime' shifts the stored value
+// into local time, but '%s' formats it as if it were still UTC, so without the
+// conversion back the cutoff is wrong by the host's offset.
 export function openCodeSql(): string {
   const oldestDayOffset = OPENCODE_HISTORY_DAYS - 1;
   return `
 WITH recent_sessions AS MATERIALIZED (
   SELECT id
   FROM session
-  WHERE time_updated >= CAST(strftime('%s', 'now', 'localtime', 'start of day', '-${oldestDayOffset} days') AS INTEGER) * 1000
+  WHERE time_updated >= CAST(strftime('%s', 'now', 'localtime', 'start of day', '-${oldestDayOffset} days', 'utc') AS INTEGER) * 1000
 )
 SELECT
   date(m.time_created / 1000, 'unixepoch', 'localtime') AS day,
@@ -485,7 +504,7 @@ SELECT
 FROM recent_sessions rs
 JOIN message m ON m.session_id = rs.id
 WHERE json_extract(m.data, '$.role') = 'assistant'
-  AND m.time_created >= CAST(strftime('%s', 'now', 'localtime', 'start of day', '-${oldestDayOffset} days') AS INTEGER) * 1000
+  AND m.time_created >= CAST(strftime('%s', 'now', 'localtime', 'start of day', '-${oldestDayOffset} days', 'utc') AS INTEGER) * 1000
 GROUP BY day, modelProviderId, model
 ORDER BY day, modelProviderId, model;`.trim();
 }
@@ -553,7 +572,111 @@ export async function syncOpenCode(
     }
   }
 }
+export async function syncOpenCodeGo(
+  bb: BbPluginApi,
+  db: Database,
+  machine: Machine,
+  signal: AbortSignal,
+  executeHostCommand = runHostCommand,
+) {
+  const attemptedAt = new Date().toISOString();
+  try {
+    const output = await executeHostCommand(bb, machine, openCodeGoUsageCommand(), signal, {
+      title: "Usage: OpenCode Go limits",
+      timeoutMs: OPENCODE_GO_SYNC_TIMEOUT_MS,
+    });
+    const windows = parseOpenCodeGoUsage(extractOpenCodeJson(output));
+    if (windows.length === 0) throw new Error("OpenCode Go usage response contained no limit windows.");
 
+    db.transaction(() => {
+      db.prepare(`INSERT INTO opencode_go_limits (machine_id, machine_name, plan_label, windows_json, fetched_at)
+        VALUES (?, ?, 'Go', ?, ?) ON CONFLICT(machine_id) DO UPDATE SET
+        machine_name=excluded.machine_name, windows_json=excluded.windows_json, fetched_at=excluded.fetched_at`)
+        .run(machine.id, machine.name, JSON.stringify(windows), attemptedAt);
+      db.prepare(`INSERT INTO opencode_go_limit_state (
+          machine_id, machine_name, status, error, last_attempt_at, last_success_at
+        ) VALUES (?, ?, 'ok', NULL, ?, ?) ON CONFLICT(machine_id) DO UPDATE SET
+        machine_name=excluded.machine_name, status='ok', error=NULL,
+        last_attempt_at=excluded.last_attempt_at, last_success_at=excluded.last_success_at`)
+        .run(machine.id, machine.name, attemptedAt, attemptedAt);
+    })();
+    bb.log.info(`${machine.name}/opencode-go: ${windows.length} limit windows`);
+  } catch (error) {
+    const message = errorMessage(error);
+    if (OPENCODE_GO_ABSENCE_ERRORS.has(message)) {
+      db.transaction(() => {
+        db.prepare("DELETE FROM opencode_go_limits WHERE machine_id=?").run(machine.id);
+        db.prepare("DELETE FROM opencode_go_limit_state WHERE machine_id=?").run(machine.id);
+      })();
+      bb.log.debug(`${machine.name}/opencode-go: not configured (${message})`);
+      return;
+    }
+
+    const hasSnapshot = Boolean(db.prepare("SELECT 1 FROM opencode_go_limits WHERE machine_id=?").get(machine.id));
+    db.prepare(`INSERT INTO opencode_go_limit_state (
+        machine_id, machine_name, status, error, last_attempt_at, last_success_at
+      ) VALUES (?, ?, 'error', ?, ?, NULL) ON CONFLICT(machine_id) DO UPDATE SET
+      machine_name=excluded.machine_name, status='error', error=excluded.error,
+      last_attempt_at=excluded.last_attempt_at`)
+      .run(machine.id, machine.name, message, attemptedAt);
+    bb.log.warn(`${machine.name}/opencode-go: ${hasSnapshot ? "retaining previous snapshot; " : ""}${message}`);
+  }
+}
+
+export function loadStoredOpenCodeGoLimits(
+  db: Database,
+  connectedMachineIds: Set<string>,
+): Array<z.infer<typeof providerLimitSchema>> {
+  const rows = db.prepare(`SELECT
+      state.machine_id machineId, state.machine_name machineName, state.status, state.error,
+      limits.plan_label planLabel, limits.windows_json windowsJson, limits.fetched_at fetchedAt
+    FROM opencode_go_limit_state state
+    LEFT JOIN opencode_go_limits limits ON limits.machine_id=state.machine_id
+    ORDER BY state.machine_name`).all() as Array<{
+    machineId: string; machineName: string; status: "ok" | "error"; error: string | null;
+    planLabel: string | null; windowsJson: string | null; fetchedAt: string | null;
+  }>;
+
+  return rows.flatMap((row): Array<z.infer<typeof providerLimitSchema>> => {
+    if (!connectedMachineIds.has(row.machineId)) return [];
+    try {
+      const windows = row.windowsJson
+        ? providerLimitWindowSchema.array().parse(JSON.parse(row.windowsJson))
+        : [];
+      if (row.status === "ok" && windows.length === 0) {
+        throw new Error("OpenCode Go has no stored limit windows.");
+      }
+      return [{
+        machineId: row.machineId,
+        machineName: row.machineName,
+        providerId: "opencode-go",
+        providerName: "OpenCode Go",
+        planLabel: row.planLabel ?? "Go",
+        windows,
+        status: row.status,
+        error: row.error,
+        lastUpdatedAt: row.fetchedAt,
+      }];
+    } catch {
+      return [{
+        machineId: row.machineId,
+        machineName: row.machineName,
+        providerId: "opencode-go",
+        providerName: "OpenCode Go",
+        planLabel: row.planLabel ?? "Go",
+        windows: [],
+        status: "error",
+        error: "Stored OpenCode Go limits could not be read.",
+        lastUpdatedAt: row.fetchedAt,
+      }];
+    }
+  });
+}
+
+// Rows are bucketed by each host's local day, so the plugin server's timezone
+// cannot decide the exact visible window without clipping a host that is ahead
+// of it. This query only bounds retention -- it fetches one extra day of slack
+// and the dashboard applies the exact range in the viewer's timezone.
 export function dashboardRecordsSql() {
   return `WITH canonical AS (
       SELECT e.*, MIN(s.machine_id) machine_id FROM usage_events e
@@ -572,7 +695,7 @@ export function dashboardRecordsSql() {
     SUM(cache_savings_usd) cacheSavingsUsd, SUM(processed_tokens) processedTokens,
     SUM(cached_input_tokens) cachedInputTokens, SUM(cache_write_tokens) cacheWriteTokens,
     SUM(uncached_input_tokens) uncachedInputTokens, SUM(output_tokens) outputTokens
-    FROM canonical WHERE day >= date('now', 'localtime', '-${DASHBOARD_HISTORY_DAYS - 1} days')
+    FROM canonical WHERE day >= date('now', 'localtime', '-${DASHBOARD_HISTORY_DAYS} days')
     AND NOT (provider_id='claude' AND model='<synthetic>' AND processed_tokens=0)
     GROUP BY day, provider_id, model_provider_id, machine_id, model, project ORDER BY day`;
 }
@@ -600,7 +723,7 @@ export default async function plugin(bb: BbPluginApi) {
     },
   });
   const db = bb.storage.database();
-  bb.storage.migrate(db, [migration, pricingMigration, syncMetadataMigration, multiAgentMigration, pricingCatalogMigration, projectMigration]);
+  bb.storage.migrate(db, [migration, pricingMigration, syncMetadataMigration, multiAgentMigration, pricingCatalogMigration, projectMigration, openCodeGoLimitsMigration]);
   activateCachedCatalog(db);
   const syncCoordinator = createSyncCoordinator({
     completedAt: readLastCompletedSyncAt(db),
@@ -642,6 +765,7 @@ export default async function plugin(bb: BbPluginApi) {
           syncJsonAgent(bb, db, machine, home, "prime", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
           syncJsonAgent(bb, db, machine, home, "antigravity", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
           syncOpenCode(bb, db, machine, timeoutSignal(OPENCODE_SYNC_TIMEOUT_MS, serviceSignal)),
+          syncOpenCodeGo(bb, db, machine, timeoutSignal(OPENCODE_GO_SYNC_TIMEOUT_MS, serviceSignal)),
         ]);
       }
       return new Date().toISOString();
@@ -670,7 +794,11 @@ export default async function plugin(bb: BbPluginApi) {
           FROM usage_sources GROUP BY machine_id ORDER BY name`).all() as typeof machines;
       }
       const machineNames = new Map(machines.map((machine) => [machine.id, machine.name]));
-      const providerLimits = await loadProviderLimits(bb, machines, db);
+      const connectedMachineIds = new Set(machines.filter((machine) => machine.status === "connected").map((machine) => machine.id));
+      const providerLimits = [
+        ...await loadProviderLimits(bb, machines, db),
+        ...loadStoredOpenCodeGoLimits(db, connectedMachineIds),
+      ];
       const rows = db.prepare(dashboardRecordsSql()).all() as Array<Omit<DashboardRecord, "machineName">>;
       const records = rows.map((row) => ({ ...row, machineName: machineNames.get(row.machineId) ?? "Unknown machine" }));
       const sources = db.prepare(`SELECT machine_id machineId, provider_id agentId, status, last_attempt_at lastAttemptAt,

@@ -58,12 +58,14 @@ const scanResultSchema = z.object({
 // every runtime dependency inside the function or pass it through `dependencies`.
 async function hostJsonCollector(encodedInput: string, dependencies: CollectorDependencies) {
   const { buffer, fs, path, crypto, readline, zlib } = dependencies;
-// v2: retained hashed Claude response identities so repeated transcript rows
+  // v2: retained hashed Claude response identities so repeated transcript rows
   // and copied/forked transcripts can be deduplicated before aggregation.
-  // v3: bucket days in the host's local timezone, drop cached zero-token /
-  // zero-cost rows (every file re-parses with the token guard), and add the
-  // per-session project label to every aggregate row.
-  const cacheVersion = 3;
+  // v3: added the per-session project label to every aggregate row.
+  // v4: buckets days in the host's local timezone instead of UTC and drops
+  // zero-token / zero-cost rows. Cached rows store a precomputed `day`, so the
+  // version MUST rise or upgraded hosts keep serving UTC buckets forever,
+  // silently mixed with newly parsed local ones.
+  const cacheVersion = 4;
   const scanBegin = "__BB_USAGE_SCAN_BEGIN__";
   const scanEnd = "__BB_USAGE_SCAN_END__";
   const input = JSON.parse(buffer.from(encodedInput, "base64").toString("utf8")) as HostJsonScanInput;
@@ -357,7 +359,7 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
           day: usageDay,
           modelProviderId: text(message.provider, "unknown"),
           model: text(message.responseModel, text(message.model, "unknown")),
-project: sessionProject,
+          project: sessionProject,
           loggedCostUsd,
           uncachedInputTokens: count(usage.input), cachedInputTokens: count(usage.cacheRead),
           cacheWriteTokens: count(usage.cacheWrite), outputTokens: count(usage.output),
@@ -410,8 +412,10 @@ project: sessionProject,
       nextFiles[sourceId] = { signature, rows };
       for (const row of rows) row.eventKey ? mergeEvent(allEvents, row) : add(allRows, row);
       changedFileCount += 1;
-    } catch (error) {
-      failures.push("A usage log could not be read: " + filePath + " (" + String(error) + ")");
+    } catch {
+      // Absolute host paths and raw errors must not cross the host boundary;
+      // this string is persisted in sync state and shown in the dashboard.
+      failures.push("A usage log could not be read.");
       if (prior && Array.isArray(prior.rows) && prior.rows.every(validRow)) {
         nextFiles[sourceId] = prior;
         for (const row of prior.rows) row.eventKey ? mergeEvent(allEvents, row) : add(allRows, row);
