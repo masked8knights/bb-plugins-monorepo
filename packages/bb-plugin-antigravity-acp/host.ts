@@ -1,8 +1,8 @@
 /**
  * bb.host artifact for the Antigravity provider. Same shape as
  * bb-plugin-omniroute-acp/host.ts (see that file for the protocol notes and
- * why config is shared through a fixed OS-temp-dir path rather than either
- * consumer's own per-process dataDir).
+ * why config is shared through a private OS-temp-dir directory rather than
+ * either consumer's own per-process dataDir).
  *
  * Unlike OmniRoute (an HTTP proxy), Antigravity is a local CLI (`agy`) with
  * its own OAuth state — the bridge shells out to it per turn rather than
@@ -19,13 +19,17 @@
 import { experimental_defineHostEntry } from "@get-bb/plugin-sdk/host";
 import {
   type PromptInput,
-  type ThreadEvent,
+  type ThreadDelta,
   BRIDGE_JSON_RPC_ERRORS,
   BRIDGE_NOTIFICATION_METHODS,
   BRIDGE_REQUEST_METHODS,
   PROVIDER_BRIDGE_PROTOCOL_VERSION,
+  THREAD_DELTA_GRAMMAR_V3,
+  THREAD_DELTA_NOTIFICATION_METHOD,
+  createBridgeIo,
   initializeParamsSchema,
   modelListParamsSchema,
+  runBridgeRequest,
   threadResumeParamsSchema,
   threadStartParamsSchema,
   threadStopParamsSchema,
@@ -34,7 +38,7 @@ import {
   experimental_defineProviderBridge,
 } from "@get-bb/plugin-sdk/provider-bridge";
 import { randomUUID } from "node:crypto";
-import { readFileSync, writeFileSync, existsSync, appendFileSync, mkdirSync } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { execFile, spawn } from "node:child_process";
@@ -70,13 +74,27 @@ function runAgyNoStdin(bin: string, args: string[], timeoutMs: number): Promise<
   });
 }
 
-const configPath = join(tmpdir(), "bb-plugin-antigravity-acp-config.json");
+const configDir = join(tmpdir(), "bb-plugin-antigravity-acp");
+const configPath = join(configDir, "config.json");
+const legacyConfigPath = join(tmpdir(), "bb-plugin-antigravity-acp-config.json");
+
+function writeConfig(input: object): void {
+  mkdirSync(configDir, { recursive: true, mode: 0o700 });
+  chmodSync(configDir, 0o700);
+  writeFileSync(configPath, JSON.stringify(input), { encoding: "utf8", mode: 0o600 });
+  chmodSync(configPath, 0o600);
+  try {
+    unlinkSync(legacyConfigPath);
+  } catch {
+    // The legacy file is absent after the first successful migration.
+  }
+}
 
 export default experimental_defineHostEntry({
   contract: antigravityHostContract,
   handlers: {
     setConfig: (input) => {
-      writeFileSync(configPath, JSON.stringify(input));
+      writeConfig(input);
       return { ok: true as const };
     },
   },
@@ -101,7 +119,6 @@ function loadConfig(): AntigravityConfig {
 
 const instanceNonce = randomUUID().replaceAll("-", "").slice(0, 12);
 let threadCounter = 0;
-let turnCounter = 0;
 /** Our own threadId -> agy's own conversation_id, once known. */
 const agyConversationByThread = new Map<string, string>();
 /** threadId -> { providerThreadId, model } — model is frozen at thread construction. */
@@ -109,20 +126,14 @@ const sessions = new Map<string, { providerThreadId: string; model: string; reas
 
 type JsonRpcId = string | number;
 
-function writeMessage(message: Record<string, unknown>): void {
-  process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", ...message })}\n`);
-}
-function respondResult(id: JsonRpcId, result: unknown): void {
-  writeMessage({ id, result });
-}
-function respondError(id: JsonRpcId, code: number, message: string, data?: unknown): void {
-  writeMessage({ id, error: { code, message, ...(data !== undefined ? { data } : {}) } });
-}
+type OutboundMessage = { jsonrpc: "2.0" } & Record<string, unknown>;
+const io = createBridgeIo<OutboundMessage>();
+
 function notify(method: string, params: Record<string, unknown>): void {
-  writeMessage({ method, params });
+  io.send({ jsonrpc: "2.0", method, params });
 }
-function emitThreadEvent(threadId: string, event: ThreadEvent): void {
-  notify(BRIDGE_NOTIFICATION_METHODS.threadEvent, { threadId, event });
+function emitDeltas(threadId: string, deltas: ThreadDelta[]): void {
+  notify(THREAD_DELTA_NOTIFICATION_METHOD, { threadId, deltas });
 }
 
 function promptText(input: readonly PromptInput[]): string {
@@ -335,30 +346,16 @@ async function runTurn(args: {
   input: readonly PromptInput[];
   clientRequestId?: string;
 }): Promise<void> {
-  turnCounter += 1;
-  const turnId = `turn_agy_${instanceNonce}_${turnCounter}`;
-  const itemId = `${turnId}_item_1`;
-  const scope = { kind: "turn", turnId } as const;
-  const base = { threadId: args.threadId, providerThreadId: args.providerThreadId };
-
-  // Matches the ordering fix verified against a live bb 0.39.0 server in
-  // bb-plugin-omniroute-acp: turn/started must be stored before
-  // turn/input/accepted, or the server rejects the latter with a 409.
-  emitThreadEvent(args.threadId, { type: "turn/started", ...base, scope });
+  const itemId = `agy_${args.providerThreadId}_${randomUUID()}`;
+  const deltas: ThreadDelta[] = [];
   if (args.clientRequestId !== undefined) {
-    emitThreadEvent(args.threadId, {
-      type: "turn/input/accepted",
-      ...base,
+    deltas.push({
+      kind: "input.accepted",
       clientRequestId: args.clientRequestId,
-      scope,
     });
   }
-  emitThreadEvent(args.threadId, {
-    type: "item/started",
-    ...base,
-    item: { type: "agentMessage", id: itemId, text: "" },
-    scope,
-  });
+  deltas.push({ kind: "turn.open" });
+  emitDeltas(args.threadId, deltas);
 
   const result = await callAgy(args.threadId, args.model, args.reasoningLevel, promptText(args.input));
   let text: string;
@@ -369,31 +366,26 @@ async function runTurn(args: {
     if (result.conversationId) agyConversationByThread.set(args.threadId, result.conversationId);
   }
 
-  emitThreadEvent(args.threadId, {
-    type: "item/agentMessage/delta",
-    ...base,
-    itemId,
-    delta: text,
-    scope,
-  });
-  emitThreadEvent(args.threadId, {
-    type: "item/completed",
-    ...base,
-    item: { type: "agentMessage", id: itemId, text },
-    scope,
-  });
-  emitThreadEvent(args.threadId, {
-    type: "turn/completed",
-    ...base,
-    status: "error" in result ? "failed" : "completed",
-    scope,
-  });
+  emitDeltas(args.threadId, [
+    {
+      kind: "item.open",
+      key: { providerItemId: itemId },
+      item: { type: "agentMessage", text: "" },
+    },
+    {
+      kind: "item.textClose",
+      key: { providerItemId: itemId },
+      channel: "agentMessage",
+      text,
+    },
+    { kind: "turn.boundary", status: "error" in result ? "failed" : "completed" },
+  ]);
 }
 
 type RequestHandler = (id: JsonRpcId, params: unknown) => void;
 
 function invalidParams(id: JsonRpcId, method: string, issues: unknown): void {
-  respondError(id, BRIDGE_JSON_RPC_ERRORS.INVALID_PARAMS, `Invalid params for ${method}`, issues);
+  io.sendError(id, BRIDGE_JSON_RPC_ERRORS.INVALID_PARAMS, `Invalid params for ${method}`, issues);
 }
 
 const handlers: Record<string, RequestHandler> = {
@@ -403,7 +395,19 @@ const handlers: Record<string, RequestHandler> = {
       invalidParams(id, BRIDGE_REQUEST_METHODS.initialize, parsed.error.issues);
       return;
     }
-    respondResult(id, { protocolVersion: PROVIDER_BRIDGE_PROTOCOL_VERSION, capabilities: {} });
+    io.sendResult(id, {
+      protocolVersion: PROVIDER_BRIDGE_PROTOCOL_VERSION,
+      capabilities: {
+        grammarVersions: [THREAD_DELTA_GRAMMAR_V3, THREAD_DELTA_GRAMMAR_V3],
+        sessionRestore: false,
+        threadArchive: false,
+        threadRename: false,
+        threadGoalClear: false,
+        fork: "none",
+        approvalEnforcedBy: "runtime",
+        steerMode: "queue",
+      },
+    });
   },
 
   [BRIDGE_REQUEST_METHODS.modelList]: (id, params) => {
@@ -414,7 +418,7 @@ const handlers: Record<string, RequestHandler> = {
     }
     const config = loadConfig();
     void fetchAgyModels(config).then((models) => {
-      respondResult(id, { models, selectedOnlyModels: [] });
+      io.sendResult(id, { models, selectedOnlyModels: [] });
     });
   },
 
@@ -434,7 +438,8 @@ const handlers: Record<string, RequestHandler> = {
       threadId: parsed.data.threadId,
       providerThreadId,
     });
-    respondResult(id, { providerThreadId });
+    emitDeltas(parsed.data.threadId, [{ kind: "session.reset" }]);
+    io.sendResult(id, { providerThreadId, sessionRestorable: false });
     if (parsed.data.input !== undefined && parsed.data.input.length > 0) {
       void runTurn({ threadId: parsed.data.threadId, providerThreadId, model, reasoningLevel, input: parsed.data.input });
     }
@@ -457,7 +462,8 @@ const handlers: Record<string, RequestHandler> = {
       threadId: parsed.data.threadId,
       providerThreadId: parsed.data.providerThreadId,
     });
-    respondResult(id, { providerThreadId: parsed.data.providerThreadId });
+    emitDeltas(parsed.data.threadId, [{ kind: "session.reset" }]);
+    io.sendResult(id, { providerThreadId: parsed.data.providerThreadId, sessionRestorable: false });
   },
 
   [BRIDGE_REQUEST_METHODS.turnStart]: (id, params) => {
@@ -466,8 +472,12 @@ const handlers: Record<string, RequestHandler> = {
       invalidParams(id, BRIDGE_REQUEST_METHODS.turnStart, parsed.error.issues);
       return;
     }
-    respondResult(id, {});
     const session = sessions.get(parsed.data.threadId);
+    if (session === undefined) {
+      io.sendError(id, BRIDGE_JSON_RPC_ERRORS.INVALID_PARAMS, `No session for thread ${parsed.data.threadId}; send thread/start or thread/resume first`);
+      return;
+    }
+    io.sendResult(id, {});
     const config = loadConfig();
     const model = parsed.data.options?.model || session?.model || config.model;
     const reasoningLevel = parsed.data.options?.reasoningLevel || session?.reasoningLevel;
@@ -487,7 +497,7 @@ const handlers: Record<string, RequestHandler> = {
       invalidParams(id, BRIDGE_REQUEST_METHODS.turnSteer, parsed.error.issues);
       return;
     }
-    respondError(
+    io.sendError(
       id,
       BRIDGE_JSON_RPC_ERRORS.NO_ACTIVE_TURN,
       `No active turn to steer (expected ${parsed.data.expectedTurnId})`,
@@ -502,7 +512,7 @@ const handlers: Record<string, RequestHandler> = {
     }
     sessions.delete(parsed.data.threadId);
     agyConversationByThread.delete(parsed.data.threadId);
-    respondResult(id, {});
+    io.sendResult(id, {});
   },
 };
 
@@ -521,10 +531,14 @@ export function handleLine(line: string): void {
   if (typeof id !== "string" && typeof id !== "number") return;
   const handler = handlers[method];
   if (handler === undefined) {
-    respondError(id, BRIDGE_JSON_RPC_ERRORS.METHOD_NOT_FOUND, `Method not found: ${method}`);
+    io.sendError(id, BRIDGE_JSON_RPC_ERRORS.METHOD_NOT_FOUND, `Method not found: ${method}`);
     return;
   }
-  handler(id, params);
+  void runBridgeRequest({
+    request: { id, method, params },
+    sendError: io.sendError,
+    handleRequest: async (request) => handler(request.id, request.params),
+  });
 }
 
 export const experimental_providerBridge = experimental_defineProviderBridge({
